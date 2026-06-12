@@ -1,0 +1,43 @@
+# Data — never commit raw MRI data
+data/
+
+# Checkpoints and logs
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+logs/
+runs/
+train.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / dist
+dist/
+build/
+*.egg-info/
