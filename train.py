@@ -398,18 +398,22 @@ def train_epoch(
 
 @torch.inference_mode()
 def validate_epoch(
-    model:      nn.Module,
-    loader:     DataLoader,
-    metric:     DiceMetric,
-    device:     torch.device,
-    cfg:        Config,
-    stage1_net: Optional[nn.Module] = None,
+    model:         nn.Module,
+    loader:        DataLoader,
+    metric:        DiceMetric,
+    device:        torch.device,
+    cfg:           Config,
+    stage1_net:    Optional[nn.Module] = None,
+    channel_names: Optional[List[str]] = None,
 ) -> Dict[str, float]:
     """
     Validate with patch-based forward pass; return per-channel and mean Dice.
 
-    Returns dict with keys: "ET", "TC", "WT", "mean"
+    channel_names controls the keys returned. Use ["WT"] for Stage-1 (1 output
+    channel) and ["ET", "TC", "WT"] (default) for Stage-2.
     """
+    if channel_names is None:
+        channel_names = ["ET", "TC", "WT"]
     model.eval()
     metric.reset()
 
@@ -426,14 +430,17 @@ def validate_epoch(
         if isinstance(outputs, (list, tuple)):
             outputs = outputs[0]
 
-        probs  = torch.sigmoid(outputs)
-        preds  = post_process_et(probs, min_et_voxels=cfg.min_et_voxels)
+        probs = torch.sigmoid(outputs)
+        if probs.shape[1] >= 3:
+            preds = post_process_et(probs, min_et_voxels=cfg.min_et_voxels)
+        else:
+            preds = (probs >= 0.5).float()
         metric(preds, labels)
 
     scores, not_nans = metric.aggregate()
     metric.reset()
 
-    ch = {name: scores[i].item() for i, name in enumerate(["ET", "TC", "WT"])}
+    ch = {name: scores[i].item() for i, name in enumerate(channel_names)}
     ch["mean"] = float(np.nanmean([v for v in ch.values()]))
     return ch
 
@@ -519,13 +526,14 @@ def train_stage1(cfg: Config, logger: logging.Logger):
         )
         scheduler.step()
 
-        scores = validate_epoch(model, val_loader, metric, device, cfg)
+        scores = validate_epoch(model, val_loader, metric, device, cfg,
+                                channel_names=["WT"])
         mean_dice = scores["mean"]
 
         logger.info(
             f"Stage-1  epoch {epoch:>3d}/{cfg.stage1_epochs}"
             f"  train_loss={train_loss:.4f}"
-            f"  val_WT_dice={scores.get('ET', scores['mean']):.4f}"   # single WT channel
+            f"  val_WT_dice={scores['WT']:.4f}"
         )
 
         is_best = mean_dice > best_dice
