@@ -364,6 +364,12 @@ def train_epoch(
         with autocast("cuda", enabled=cfg.amp):
             outputs = model(images)
 
+            # MONAI DynUNet deep_supervision=True returns a stacked tensor
+            # [B, num_levels, C, H, W, D] rather than a list; normalise here.
+            if (deep_sup and isinstance(outputs, torch.Tensor)
+                    and outputs.ndim == 6):
+                outputs = list(torch.unbind(outputs, dim=1))
+
             if deep_sup and isinstance(outputs, (list, tuple)):
                 loss = deep_supervision_loss(
                     outputs, criterion, labels, cfg.ds_weights

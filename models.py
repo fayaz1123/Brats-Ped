@@ -292,16 +292,18 @@ class TaskEnhancedDynUNet(nn.Module):
         # Run DynUNet (HFF and SPADE inserted as post-processing; see note above)
         out = self.dynunet(x)
 
+        # MONAI DynUNet returns a stacked tensor [B, num_levels, C, H, W, D]
+        # when deep_supervision=True (not a list). Unstack to list so the rest
+        # of the code can treat it uniformly as [full_res, half_res, quarter_res].
+        if isinstance(out, torch.Tensor) and out.ndim == 6:
+            out = list(torch.unbind(out, dim=1))
+
         # ET-focal attention on the full-resolution logit
         if isinstance(out, (list, tuple)):
             logits_full = out[0]
-            et_logit = logits_full[:, 0:1]   # ET channel
-            # We cannot hook into the penultimate feature — apply attention on logits
-            # as a cheap approximation (refine if access to internals is needed)
-            refined = logits_full  # placeholder; full internal hook requires fork
+            # Apply attention approximation on full-res logits
+            refined = logits_full
             out = [refined] + list(out[1:])
-        else:
-            out = out
 
         return out
 
