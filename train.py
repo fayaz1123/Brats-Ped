@@ -409,6 +409,7 @@ def validate_epoch(
     metric:        DiceMetric,
     device:        torch.device,
     cfg:           Config,
+    logger:        logging.Logger,
     stage1_net:    Optional[nn.Module] = None,
     channel_names: Optional[List[str]] = None,
 ) -> Dict[str, float]:
@@ -423,7 +424,10 @@ def validate_epoch(
     model.eval()
     metric.reset()
 
-    for batch in loader:
+    n_val = len(loader)
+    for val_idx, batch in enumerate(loader, 1):
+        if val_idx % 10 == 0 or val_idx == n_val:
+            logger.info(f"  [val] {val_idx}/{n_val}")
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
 
@@ -532,7 +536,7 @@ def train_stage1(cfg: Config, logger: logging.Logger):
         )
         scheduler.step()
 
-        scores = validate_epoch(model, val_loader, metric, device, cfg,
+        scores = validate_epoch(model, val_loader, metric, device, cfg, logger,
                                 channel_names=["WT"])
         mean_dice = scores["mean"]
 
@@ -680,7 +684,7 @@ def train_stage2_fold(
         )
         scheduler.step()
 
-        scores    = validate_epoch(model, val_loader, metric, device, cfg,
+        scores    = validate_epoch(model, val_loader, metric, device, cfg, logger,
                                    stage1_net=stage1_net)
         mean_dice = scores["mean"]
 
