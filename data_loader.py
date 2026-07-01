@@ -4,20 +4,22 @@ BraTS-PED 2025 data loader with MONAI-based augmentation pipeline.
 Scans data/BraTS-PEDs_Batch2_Release and data/BraTS26_PED_training (if present).
 Modalities loaded as 4-channel input: t1c, t1n, t2f, t2w.
 
-BraTS-PED 2025 label convention (NOT skull-stripped, only defaced):
+BraTS-PEDs 2026 label convention — RAPNO 4-label (NOT skull-stripped, only defaced):
   0 → background
-  1 → NCR  / NETC (Necrotic Tumor Core)
-  2 → TALI / ED   (Tumor-Associated Leptomeningeal Involvement / peritumoral edema)
-  3 → ET           (GD-Enhancing Tumor)
+  1 → ET  (Enhancing Tumor)
+  2 → NET (Nonenhancing Tumor)
+  3 → CC  (Cystic Component)
+  4 → ED  (Peritumoral Edema)
 
-Output: 3-channel binary masks in order [ET, NETC, TALI]:
-  ET   = label 3            (channel 0)
-  NETC = label 1            (channel 1) — NCR only, NOT including ET
-  TALI = label 2            (channel 2) — edema, directly predicted
+Output: 4-channel binary masks in order [ET, NET, CC, ED]:
+  ET  = label 1             (channel 0) — enhancing tumor
+  NET = label 2             (channel 1) — nonenhancing tumor
+  CC  = label 3             (channel 2) — cystic component
+  ED  = label 4             (channel 3) — peritumoral edema
 
 Derived for submission:
-  TC = ET | NETC
-  WT = ET | NETC | TALI
+  TC = ET | NET | CC        = labels 1|2|3
+  WT = ET | NET | CC | ED   = labels 1|2|3|4
 """
 
 import os
@@ -60,17 +62,23 @@ from monai.transforms import (
 
 class ConvertBratsPed2025Labelsd(MapTransform):
     """
-    Convert scalar BraTS-PED 2025 label map to 3 binary channels:
-      channel 0 → ET   (label 3)
-      channel 1 → NETC (label 1)  — NCR only, not ET
-      channel 2 → TALI (label 2)  — edema/ED, directly predicted
+    Convert scalar BraTS-PEDs 2026 (RAPNO 4-label) label map to 4 binary channels:
+      channel 0 → ET  (label 1)   — enhancing tumor
+      channel 1 → NET (label 2)   — nonenhancing tumor
+      channel 2 → CC  (label 3)   — cystic component
+      channel 3 → ED  (label 4)   — peritumoral edema
 
-    Each sub-region is a direct prediction target so every channel gets its
-    own Dice loss. TC and WT are derived at inference: TC = ET|NETC, WT = ET|NETC|TALI.
+    Each sub-region is a direct prediction target so every channel gets its own
+    Dice loss. TC and WT are derived at inference exactly as the challenge
+    defines them:
+      TC = ET | NET | CC      = labels 1|2|3
+      WT = ET | NET | CC | ED = labels 1|2|3|4
 
-    MONAI's built-in ConvertToMultiChannelBasedOnBratsClassesd targets the
-    BraTS 2018 convention (ET = label 4) and produces wrong channels for
-    BraTS-PED 2025 where ET = label 3.
+    BraTS-PEDs 2026 label convention (4 labels):
+      1 → ET  (Enhancing Tumor)
+      2 → NET (Nonenhancing Tumor)
+      3 → CC  (Cystic Component)
+      4 → ED  (Peritumoral Edema)
     """
 
     def __call__(self, data):
@@ -80,13 +88,14 @@ class ConvertBratsPed2025Labelsd(MapTransform):
             # squeeze channel dim added by EnsureChannelFirstd
             if lbl.ndim == 4 and lbl.shape[0] == 1:
                 lbl = lbl.squeeze(0)
-            et   = lbl == 3
-            netc = lbl == 1
-            tali = lbl == 2
+            et  = lbl == 1
+            net = lbl == 2
+            cc  = lbl == 3
+            ed  = lbl == 4
             if isinstance(lbl, torch.Tensor):
-                d[key] = torch.stack([et, netc, tali], dim=0).float()
+                d[key] = torch.stack([et, net, cc, ed], dim=0).float()
             else:
-                d[key] = np.stack([et, netc, tali], axis=0).astype(np.float32)
+                d[key] = np.stack([et, net, cc, ed], axis=0).astype(np.float32)
         return d
 
 
@@ -176,7 +185,7 @@ def _base_transforms() -> List:
             pixdim=TARGET_SPACING,
             mode=("bilinear", "nearest"),
         ),
-        # BraTS-PED 2025 labels 1/2/3 → 3-channel binary masks [ET, TC, WT]
+        # BraTS-PEDs 2026 labels 1/2/3/4 → 4-channel binary masks [ET, NET, CC, ED]
         ConvertBratsPed2025Labelsd(keys=["label"]),
         # Remove background air padding (skull is preserved — threshold > 0 keeps
         # all tissue voxels including skull since data is not skull-stripped)
@@ -435,7 +444,7 @@ if __name__ == "__main__":
     print(f"Label shape  : {lbl.shape}  dtype: {lbl.dtype}")
     print(f"Image range  : [{img.min():.3f}, {img.max():.3f}]")
     # Each label channel is binary; report positive-voxel fraction per channel
-    ch_names = ["ET", "TC", "WT"]
+    ch_names = ["ET", "NET", "CC", "ED"]
     for i, name in enumerate(ch_names):
         frac = lbl[0, i].float().mean().item()
         print(f"  {name} positive fraction: {frac:.4f}")

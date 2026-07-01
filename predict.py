@@ -5,11 +5,12 @@ Runs sliding-window inference (+ optional 8-flip TTA) on every subject in
 data/BraTS26_PED_validation, converts predictions to BraTS label format,
 resamples back to the original image space, and writes a submission.zip.
 
-Label convention (BraTS-PED 2026):
+Label convention (BraTS-PEDs 2026 — RAPNO 4-label):
   0 → background
-  1 → NCR  (necrotic core)
-  2 → TALI (peritumoral oedema)
-  3 → ET   (enhancing tumour)
+  1 → ET  (enhancing tumor)
+  2 → NET (nonenhancing tumor)
+  3 → CC  (cystic component)
+  4 → ED  (peritumoral edema)
 
 Output filenames inside the zip: {subject_id}-seg.nii.gz
 
@@ -166,19 +167,21 @@ def predict_volume(
                 probs = torch.flip(probs, axes)
             all_probs.append(probs.cpu())
 
-    mean_probs = torch.stack(all_probs).mean(0)          # (1, 3, H, W, D)
+    mean_probs = torch.stack(all_probs).mean(0)          # (1, 4, H, W, D)
     mean_probs = post_process_et(mean_probs, min_et_voxels=10)
 
-    p    = mean_probs[0].numpy()                           # (3, H, W, D) — [ET, NETC, TALI]
-    et   = p[0] >= 0.5
-    netc = p[1] >= 0.5
-    tali = p[2] >= 0.4    # slightly lower: edema is diffuse, recall > precision
+    p   = mean_probs[0].numpy()                            # (4, H, W, D) — [ET, NET, CC, ED]
+    et  = p[0] >= 0.5
+    net = p[1] >= 0.5
+    cc  = p[2] >= 0.5
+    ed  = p[3] >= 0.4    # slightly lower: edema is diffuse, recall > precision
 
-    # Priority: ET > NETC > TALI (higher-confidence class overwrites)
-    seg        = np.zeros(et.shape, dtype=np.uint8)
-    seg[tali]  = 2    # TALI / ED
-    seg[netc]  = 1    # NETC
-    seg[et]    = 3    # ET
+    # Priority ET > NET > CC > ED (higher-priority class overwrites on overlap)
+    seg       = np.zeros(et.shape, dtype=np.uint8)
+    seg[ed]   = 4    # ED  — peritumoral edema
+    seg[cc]   = 3    # CC  — cystic component
+    seg[net]  = 2    # NET — nonenhancing tumor
+    seg[et]   = 1    # ET  — enhancing tumor
 
     return seg
 

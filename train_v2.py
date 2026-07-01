@@ -174,8 +174,8 @@ def train_epoch(
                 logits_full = outputs
 
             et_loss  = et_criterion(logits_full, labels)
-            # WT = union of ET | NETC | TALI (channels 0, 1, 2)
-            wt_binary = (labels[:, 0:1] + labels[:, 1:2] + labels[:, 2:3]).clamp(0, 1).float()
+            # WT = union of all sub-region channels [ET, NET, CC, ED]
+            wt_binary = labels.amax(dim=1, keepdim=True).float()
             wt_gt     = F.interpolate(wt_binary, size=wt_aux_logit.shape[2:], mode="nearest")
             aux_loss  = F.binary_cross_entropy_with_logits(wt_aux_logit, wt_gt)
 
@@ -255,7 +255,7 @@ def train_all(
     )
 
     criterion    = DiceCELoss(sigmoid=True, squared_pred=True, reduction="mean")
-    et_criterion = ETFocalLoss(et_weight=3.0, tali_weight=2.0, gamma=2.0)
+    et_criterion = ETFocalLoss(et_weight=3.0, ed_weight=2.0, gamma=2.0)
     optimizer    = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler    = LambdaLR(
         optimizer,

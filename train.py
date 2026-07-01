@@ -158,7 +158,7 @@ def train_epoch(
     pbar = tqdm(loader, desc=f"Ep {epoch:>3d}", unit="batch", dynamic_ncols=True, leave=False)
     for i, batch in enumerate(pbar):
         images = batch["image"].to(device)   # (B, 4, H, W, D)
-        labels = batch["label"].to(device)   # (B, 3, H, W, D)
+        labels = batch["label"].to(device)   # (B, 4, H, W, D) — [ET, NET, CC, ED]
 
         if i % accum == 0:
             optimizer.zero_grad()
@@ -178,9 +178,11 @@ def train_epoch(
             # ET-focal loss on full-resolution output
             et_loss = et_criterion(logits_full, labels)
 
-            # Auxiliary WT BCE (coarse WT self-supervision for SPADE conditioning)
+            # Auxiliary WT BCE (coarse WT self-supervision for SPADE conditioning).
+            # WT = union of all sub-region channels [ET, NET, CC, ED].
+            wt_full = labels.amax(dim=1, keepdim=True).float()
             wt_gt   = F.interpolate(
-                labels[:, 2:3].float(), size=wt_aux_logit.shape[2:], mode="nearest"
+                wt_full, size=wt_aux_logit.shape[2:], mode="nearest"
             )
             aux_loss = F.binary_cross_entropy_with_logits(wt_aux_logit, wt_gt)
 
@@ -246,6 +248,19 @@ def tta_predict(model: nn.Module, images: torch.Tensor, cfg: Config) -> torch.Te
     return torch.stack(preds).mean(0)
 
 
+def _with_derived_regions(x: torch.Tensor) -> torch.Tensor:
+    """Append derived TC and WT channels to a 4-channel [ET, NET, CC, ED] mask.
+
+    Returns 6 channels [ET, NET, CC, ED, TC, WT] so DiceMetric reports every
+    region scored on the BraTS-PEDs 2026 leaderboard:
+      TC = ET | NET | CC       (channels 0,1,2)
+      WT = ET | NET | CC | ED   (channels 0,1,2,3)
+    """
+    tc = x[:, 0:3].amax(dim=1, keepdim=True)
+    wt = x[:, 0:4].amax(dim=1, keepdim=True)
+    return torch.cat([x, tc, wt], dim=1)
+
+
 @torch.inference_mode()
 def validate_epoch(
     model:  nn.Module,
@@ -272,14 +287,15 @@ def validate_epoch(
             probs = _sw_predict(model, images, cfg)
 
         preds = post_process_et(probs, min_et_voxels=cfg.min_et_voxels)
-        metric(preds, labels)
+        # Score all six leaderboard regions: 4 subregions + derived TC and WT
+        metric(_with_derived_regions(preds), _with_derived_regions(labels))
 
     scores, _ = metric.aggregate()
     metric.reset()
 
-    names = ["ET", "TC", "WT"]
+    names = ["ET", "NET", "CC", "ED", "TC", "WT"]
     ch = {name: scores[i].item() for i, name in enumerate(names)}
-    ch["mean"] = float(np.nanmean(list(ch.values())))
+    ch["mean"] = float(np.nanmean([ch[n] for n in names]))
     return ch
 
 
@@ -369,8 +385,9 @@ def train_fold(
         logger.info(
             f"Fold {fold} | epoch {epoch:>3d}/{cfg.epochs}"
             f"  loss={train_loss:.4f}"
-            f"  ET={scores['ET']:.4f}  TC={scores['TC']:.4f}"
-            f"  WT={scores['WT']:.4f}  mean={mean_dice:.4f}"
+            f"  ET={scores['ET']:.3f} NET={scores['NET']:.3f} CC={scores['CC']:.3f}"
+            f" ED={scores['ED']:.3f} TC={scores['TC']:.3f} WT={scores['WT']:.3f}"
+            f"  mean={mean_dice:.4f}"
         )
 
         is_best = mean_dice > best_dice

@@ -31,7 +31,7 @@ from torch.utils.checkpoint import checkpoint as grad_ckpt
 
 PATCH_SIZE   = (128, 128, 128)
 IN_CHANNELS  = 4    # t1c, t1n, t2f, t2w
-OUT_CHANNELS = 3    # [ET, NETC, TALI] — each sub-region predicted directly
+OUT_CHANNELS = 4    # [ET, NET, CC, ED] — each sub-region predicted directly
 
 _FILTERS  = [64, 128, 256, 320, 512]
 _N_BLOCKS = [2,   3,   4,   4,   4]   # MedNeXt blocks per encoder level
@@ -395,19 +395,19 @@ class MedSwinNet(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ETFocalLoss(nn.Module):
-    """BCE focal loss with per-channel class weights for [ET, NETC, TALI].
+    """BCE focal loss with per-channel class weights for [ET, NET, CC, ED].
 
     ET (ch 0) gets highest weight — smallest, hardest sub-region.
-    TALI (ch 2) gets boosted weight — diffuse edema is easy to miss.
+    ED (ch 3) gets boosted weight — diffuse edema is easy to miss.
     Focal exponent concentrates loss on uncertain boundary voxels.
     """
 
-    def __init__(self, et_weight: float = 3.0, tali_weight: float = 2.0,
+    def __init__(self, et_weight: float = 3.0, ed_weight: float = 2.0,
                  gamma: float = 2.0) -> None:
         super().__init__()
-        self.et_weight   = et_weight
-        self.tali_weight = tali_weight
-        self.gamma       = gamma
+        self.et_weight = et_weight
+        self.ed_weight = ed_weight
+        self.gamma     = gamma
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         p     = torch.sigmoid(logits)
@@ -415,8 +415,8 @@ class ETFocalLoss(nn.Module):
         pt    = torch.where(targets > 0.5, p, 1.0 - p)
         focal = (1.0 - pt) ** self.gamma * bce
         w     = torch.ones(logits.shape[1], device=logits.device)
-        w[0]  = self.et_weight    # ET   — small & hard
-        w[2]  = self.tali_weight  # TALI — diffuse, easily dominated by core loss
+        w[0]  = self.et_weight    # ET — small & hard
+        w[3]  = self.ed_weight    # ED — diffuse, easily dominated by core loss
         return (focal * w[None, :, None, None, None]).mean()
 
 
