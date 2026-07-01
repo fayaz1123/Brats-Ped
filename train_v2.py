@@ -263,6 +263,8 @@ def train_all(
     )
     scaler   = GradScaler("cuda", enabled=cfg.amp and not cfg.use_bf16)
     path_last = ckpt_dir / "last.pt"
+    path_best = ckpt_dir / "best.pt"
+    best_loss = float("inf")
 
     for epoch in range(1, cfg.epochs + 1):
         torch.cuda.reset_peak_memory_stats()
@@ -285,6 +287,13 @@ def train_all(
             "loss": train_loss,
         }
         torch.save(state, path_last)
+
+        # No validation set in full-dataset training, so "best" tracks the
+        # lowest training loss seen so far.
+        if train_loss < best_loss:
+            best_loss = train_loss
+            shutil.copy(path_last, path_best)
+            logger.info(f"  ** New best (train loss {best_loss:.4f}) — saved best.pt")
 
         if epoch % cfg.save_every == 0 or epoch == cfg.epochs:
             shutil.copy(path_last, ckpt_dir / f"epoch_{epoch:04d}.pt")
