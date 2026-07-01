@@ -6,14 +6,18 @@ Modalities loaded as 4-channel input: t1c, t1n, t2f, t2w.
 
 BraTS-PED 2025 label convention (NOT skull-stripped, only defaced):
   0 → background
-  1 → NCR  (Necrotic Tumor Core)
-  2 → TALI (Tumor-Associated Leptomeningeal Involvement / peritumoral edema)
-  3 → ET   (GD-Enhancing Tumor)
+  1 → NCR  / NETC (Necrotic Tumor Core)
+  2 → TALI / ED   (Tumor-Associated Leptomeningeal Involvement / peritumoral edema)
+  3 → ET           (GD-Enhancing Tumor)
 
-Output: 3-channel binary masks in order [ET, TC, WT]:
-  ET  = label 3
-  TC  = label 1 | label 3
-  WT  = label 1 | label 2 | label 3
+Output: 3-channel binary masks in order [ET, NETC, TALI]:
+  ET   = label 3            (channel 0)
+  NETC = label 1            (channel 1) — NCR only, NOT including ET
+  TALI = label 2            (channel 2) — edema, directly predicted
+
+Derived for submission:
+  TC = ET | NETC
+  WT = ET | NETC | TALI
 """
 
 import os
@@ -27,7 +31,6 @@ from torch.utils.data import DataLoader
 
 from monai.data import CacheDataset, list_data_collate
 from monai.transforms import (
-    CenterSpatialCropd,
     Compose,
     CropForegroundd,
     EnsureChannelFirstd,
@@ -58,9 +61,12 @@ from monai.transforms import (
 class ConvertBratsPed2025Labelsd(MapTransform):
     """
     Convert scalar BraTS-PED 2025 label map to 3 binary channels:
-      channel 0 → ET  (label 3)
-      channel 1 → TC  (label 1 | label 3)
-      channel 2 → WT  (label 1 | label 2 | label 3)
+      channel 0 → ET   (label 3)
+      channel 1 → NETC (label 1)  — NCR only, not ET
+      channel 2 → TALI (label 2)  — edema/ED, directly predicted
+
+    Each sub-region is a direct prediction target so every channel gets its
+    own Dice loss. TC and WT are derived at inference: TC = ET|NETC, WT = ET|NETC|TALI.
 
     MONAI's built-in ConvertToMultiChannelBasedOnBratsClassesd targets the
     BraTS 2018 convention (ET = label 4) and produces wrong channels for
@@ -74,13 +80,13 @@ class ConvertBratsPed2025Labelsd(MapTransform):
             # squeeze channel dim added by EnsureChannelFirstd
             if lbl.ndim == 4 and lbl.shape[0] == 1:
                 lbl = lbl.squeeze(0)
-            et = lbl == 3
-            tc = (lbl == 1) | (lbl == 3)
-            wt = (lbl == 1) | (lbl == 2) | (lbl == 3)
+            et   = lbl == 3
+            netc = lbl == 1
+            tali = lbl == 2
             if isinstance(lbl, torch.Tensor):
-                d[key] = torch.stack([et, tc, wt], dim=0).float()
+                d[key] = torch.stack([et, netc, tali], dim=0).float()
             else:
-                d[key] = np.stack([et, tc, wt], axis=0).astype(np.float32)
+                d[key] = np.stack([et, netc, tali], axis=0).astype(np.float32)
         return d
 
 
@@ -259,25 +265,25 @@ def _train_transforms() -> Compose:
             RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
             # Gamma contrast — simulates non-linear scanner response
             RandAdjustContrastd(keys=["image"], prob=0.3, gamma=(0.7, 1.5)),
-            EnsureTyped(keys=["image", "label"]),
+            # track_meta=False strips MetaTensor → plain Tensor so torch.compile
+            # doesn't hit cache_size_limit from MetaTensor.__torch_function__ dispatch
+            EnsureTyped(keys=["image", "label"], track_meta=False),
         ]
     )
 
 
 def _val_transforms() -> Compose:
     """
-    Deterministic validation: preprocess + pad-then-center-crop to PATCH_SIZE.
-    Using a fixed crop (not random) ensures reproducible validation metrics.
-    For full-volume evaluation use inference_transforms() with sliding-window.
+    Validation transforms: full-volume preprocessing without spatial cropping.
+    CropForegroundd (k_divisible=PATCH_SIZE) ensures each dim is divisible by
+    the patch size; sliding-window inference in validate_epoch handles the rest.
     """
     return Compose(
         _base_transforms()
         + [
-            # Pad volumes that are smaller than PATCH_SIZE in any dimension
+            # Pad only if any dimension is smaller than one patch (rare for brain MRI)
             SpatialPadd(keys=["image", "label"], spatial_size=PATCH_SIZE),
-            # Deterministic centre crop — same patch every epoch
-            CenterSpatialCropd(keys=["image", "label"], roi_size=PATCH_SIZE),
-            EnsureTyped(keys=["image", "label"]),
+            EnsureTyped(keys=["image", "label"], track_meta=False),
         ]
     )
 

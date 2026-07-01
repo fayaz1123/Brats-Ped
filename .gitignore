@@ -41,3 +41,11 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Data artifacts / outputs
+predictions/
+*.zip
+manifest_*.csv
+
+# Scripts with secrets
+download_.py
