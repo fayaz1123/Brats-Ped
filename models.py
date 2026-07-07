@@ -397,12 +397,14 @@ class MedSwinNet(nn.Module):
 class ETFocalLoss(nn.Module):
     """BCE focal loss with per-channel class weights for [ET, NET, CC, ED].
 
-    ET (ch 0) gets highest weight — smallest, hardest sub-region.
-    ED (ch 3) gets boosted weight — diffuse edema is easy to miss.
-    Focal exponent concentrates loss on uncertain boundary voxels.
+    Weights are set relative to each class's *subject-level* prevalence in
+    the BraTS-PEDs training set (ET ~67%, NET ~99%, CC ~35%, ED ~22%): ED is
+    actually the rarest sub-region, present in only ~1 in 5 subjects, so it
+    is weighted higher than ET. Focal exponent concentrates loss on uncertain
+    boundary voxels.
     """
 
-    def __init__(self, et_weight: float = 3.0, ed_weight: float = 2.0,
+    def __init__(self, et_weight: float = 2.5, ed_weight: float = 3.0,
                  gamma: float = 2.0) -> None:
         super().__init__()
         self.et_weight = et_weight
@@ -450,7 +452,18 @@ def post_process_et(
     threshold: float = 0.5,
     min_et_voxels: int = 10,
 ) -> torch.Tensor:
-    """Threshold and remove ET connected components smaller than min_et_voxels."""
+    """Threshold (all channels) and remove ET connected components smaller
+    than min_et_voxels.
+
+    NOTE: this binarizes every channel at a single `threshold`, which is the
+    right behaviour for train.py's validate_epoch (it needs a hard 0/1
+    prediction to score against DiceMetric). It is NOT suitable for inference
+    pipelines that apply different thresholds per sub-region (e.g. a lower
+    recall-favouring cutoff for the diffuse ED channel) — use
+    remove_small_components() for that instead, on already-thresholded
+    per-channel masks, so the real per-channel thresholds see raw
+    probabilities rather than a pre-binarized 0.5 cutoff.
+    """
     binary = (pred >= threshold).cpu().numpy()
     for b in range(binary.shape[0]):
         et = binary[b, 0]
@@ -460,6 +473,21 @@ def post_process_et(
                 et[labeled == k] = 0
         binary[b, 0] = et
     return torch.from_numpy(binary.astype(np.float32)).to(pred.device)
+
+
+def remove_small_components(mask: np.ndarray, min_voxels: int = 10) -> np.ndarray:
+    """Zero out connected components of a binary mask smaller than min_voxels.
+
+    Operates on a single (H, W, D) boolean/binary array — use this at
+    inference on an already per-channel-thresholded mask (e.g. ET) instead of
+    post_process_et(), which forces every channel to the same threshold.
+    """
+    labeled, n = ndimage.label(mask)
+    out = mask.copy()
+    for k in range(1, n + 1):
+        if (labeled == k).sum() < min_voxels:
+            out[labeled == k] = 0
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

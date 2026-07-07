@@ -1,7 +1,7 @@
 """
 BraTS-PED 2026 — inference and submission zip generator.
 
-Runs sliding-window inference (+ optional 8-flip TTA) on every subject in
+Runs sliding-window inference (+ optional 4-flip TTA) on every subject in
 data/BraTS26_PED_validation, converts predictions to BraTS label format,
 resamples back to the original image space, and writes a submission.zip.
 
@@ -37,7 +37,7 @@ from monai.inferers import sliding_window_inference
 from tqdm import tqdm
 
 from data_loader import MODALITY_SUFFIXES, inference_transforms
-from models import IN_CHANNELS, MedSwinNet, OUT_CHANNELS, PATCH_SIZE, post_process_et
+from models import IN_CHANNELS, MedSwinNet, OUT_CHANNELS, PATCH_SIZE, remove_small_components
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark        = True
@@ -142,39 +142,46 @@ def predict_volume(
     use_tta:       bool  = True,
 ) -> np.ndarray:
     """
-    Ensemble + optional 8-flip TTA → BraTS-PED uint8 label map (H, W, D).
+    Ensemble + optional 4-flip TTA → BraTS-PED uint8 label map (H, W, D).
     """
-    image     = image.to(device)
+    image = image.to(device)
+    # 4-flip TTA: identity + one flip per spatial axis (drops the 4 multi-axis
+    # combos of the full 8-flip set to roughly halve runtime).
     flip_sets = (
-        [[], [2], [3], [4], [2, 3], [2, 4], [3, 4], [2, 3, 4]]
+        [[], [2], [3], [4]]
         if use_tta else [[]]
     )
 
     all_probs: List[torch.Tensor] = []
     for model in models:
         for axes in flip_sets:
-            inp    = torch.flip(image, axes) if axes else image
-            logits = sliding_window_inference(
-                inputs=inp,
-                roi_size=PATCH_SIZE,
-                sw_batch_size=sw_batch_size,
-                predictor=model.forward_inference,
-                overlap=sw_overlap,
-                mode="gaussian",
-            )
-            probs = torch.sigmoid(logits)
+            inp = torch.flip(image, axes) if axes else image
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                logits = sliding_window_inference(
+                    inputs=inp,
+                    roi_size=PATCH_SIZE,
+                    sw_batch_size=sw_batch_size,
+                    predictor=model.forward_inference,
+                    overlap=sw_overlap,
+                    mode="gaussian",
+                )
+            probs = torch.sigmoid(logits.float())
             if axes:
                 probs = torch.flip(probs, axes)
             all_probs.append(probs.cpu())
 
     mean_probs = torch.stack(all_probs).mean(0)          # (1, 4, H, W, D)
-    mean_probs = post_process_et(mean_probs, min_et_voxels=10)
 
     p   = mean_probs[0].numpy()                            # (4, H, W, D) — [ET, NET, CC, ED]
     et  = p[0] >= 0.5
     net = p[1] >= 0.5
     cc  = p[2] >= 0.5
     ed  = p[3] >= 0.4    # slightly lower: edema is diffuse, recall > precision
+
+    # Remove small spurious ET connected components (BraTS-style clean-up).
+    # Done on the already-thresholded boolean mask so it doesn't clobber the
+    # raw probabilities the other channels' thresholds above depend on.
+    et = remove_small_components(et, min_voxels=10)
 
     # Priority ET > NET > CC > ED (higher-priority class overwrites on overlap)
     seg       = np.zeros(et.shape, dtype=np.uint8)
@@ -243,7 +250,7 @@ def run(args: argparse.Namespace) -> None:
     models = load_models(args, device)
     log.info(
         f"Ensemble: {len(models)} model(s)"
-        f"  TTA: {'ON (8 flips)' if args.use_tta else 'OFF'}"
+        f"  TTA: {'ON (4 flips)' if args.use_tta else 'OFF'}"
         f"  sw_overlap: {args.sw_overlap}"
     )
 
@@ -292,7 +299,7 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="BraTS-PED 2026 — inference & submission zip")
-    p.add_argument("--ckpt",          default=None,
+    p.add_argument("--ckpt",          default="checkpoints/best.pt",
                    help="Single checkpoint file (e.g. checkpoints/last.pt). "
                         "Takes priority over --ckpt_dir.")
     p.add_argument("--ckpt_dir",      default="checkpoints",
@@ -305,12 +312,13 @@ def parse_args() -> argparse.Namespace:
                    help="Directory for per-subject NIfTI files")
     p.add_argument("--out",           default="submission.zip",
                    help="Output zip file path")
-    p.add_argument("--sw_batch_size", type=int,   default=4,
-                   help="Sliding-window patch batch size")
+    p.add_argument("--sw_batch_size", type=int,   default=8,
+                   help="Sliding-window patch batch size (bf16 autocast + no-grad "
+                        "inference allows a larger batch than training)")
     p.add_argument("--sw_overlap",    type=float, default=0.75,
                    help="Sliding-window overlap (0.75 recommended for submission)")
     p.add_argument("--no_tta",        action="store_true",
-                   help="Disable 8-flip TTA (faster but ~1-2%% lower Dice)")
+                   help="Disable 4-flip TTA (faster but ~1-2%% lower Dice)")
     args         = p.parse_args()
     args.use_tta = not args.no_tta
     return args

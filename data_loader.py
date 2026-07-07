@@ -41,7 +41,7 @@ from monai.transforms import (
     NormalizeIntensityd,
     Orientationd,
     RandAdjustContrastd,
-    RandCropByPosNegLabeld,
+    RandCropByLabelClassesd,
     RandFlipd,
     RandGaussianNoised,
     RandGaussianSmoothd,
@@ -166,13 +166,18 @@ TARGET_SPACING = (1.0, 1.0, 1.0)  # isotropic 1 mm
 
 def _base_transforms() -> List:
     """
-    Shared preprocessing: load → orient → resample → convert labels → normalize.
+    Shared preprocessing: load → orient → resample → normalize.
 
     Note: data is defaced but NOT skull-stripped (BraTS-PED 2025 policy).
     Skull voxels remain; CropForegroundd trims air padding using a threshold
     above background so skull tissue is preserved in the crop.
     Per-channel z-score normalization with nonzero=True correctly ignores only
     the background air, leaving skull and brain intensities intact.
+
+    Label conversion to 4-channel binary masks (ConvertBratsPed2025Labelsd) is
+    deliberately NOT included here — it happens after cropping (see
+    _train_transforms / _val_transforms) so the raw categorical label (values
+    0-4) is still available for RandCropByLabelClassesd's per-class sampling.
     """
     return [
         LoadImaged(keys=["image", "label"], ensure_channel_first=False),
@@ -185,8 +190,6 @@ def _base_transforms() -> List:
             pixdim=TARGET_SPACING,
             mode=("bilinear", "nearest"),
         ),
-        # BraTS-PEDs 2026 labels 1/2/3/4 → 4-channel binary masks [ET, NET, CC, ED]
-        ConvertBratsPed2025Labelsd(keys=["label"]),
         # Remove background air padding (skull is preserved — threshold > 0 keeps
         # all tissue voxels including skull since data is not skull-stripped)
         CropForegroundd(
@@ -222,17 +225,30 @@ def _train_transforms() -> Compose:
         _base_transforms()
         + [
             # ── Spatial augmentations ──────────────────────────────────────
-            # Foreground-biased patch sampling (2:1 positive-to-negative ratio)
-            RandCropByPosNegLabeld(
+            # Class-balanced patch sampling on the raw categorical label
+            # (0=bg, 1=ET, 2=NET, 3=CC, 4=ED), BEFORE it's split into 4
+            # binary channels. RandCropByPosNegLabeld (previous approach)
+            # treated the whole 4-channel mask as one foreground blob, so a
+            # crop centered on the dominant NET region counted as "positive"
+            # even with zero ED voxels in it — ED (rarest sub-region, present
+            # in only ~22% of subjects vs. NET's ~99%) was almost never
+            # actually sampled. Ratios below are ~inverse to each class's
+            # subject-level prevalence so every sub-region — especially ED —
+            # gets deliberate representation in training crops. When a class
+            # is absent from a given subject, MONAI zeroes its ratio for that
+            # sample and renormalizes among the classes present.
+            RandCropByLabelClassesd(
                 keys=["image", "label"],
                 label_key="label",
                 spatial_size=PATCH_SIZE,
-                pos=2,
-                neg=1,
+                ratios=[1, 2, 1, 3, 5],   # [bg, ET, NET, CC, ED]
+                num_classes=5,
                 num_samples=1,
                 image_key="image",
                 image_threshold=0,
             ),
+            # BraTS-PEDs 2026 labels 1/2/3/4 → 4-channel binary masks [ET, NET, CC, ED]
+            ConvertBratsPed2025Labelsd(keys=["label"]),
             # Axis-aligned flips — p=0.5 per axis
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
@@ -290,6 +306,8 @@ def _val_transforms() -> Compose:
     return Compose(
         _base_transforms()
         + [
+            # BraTS-PEDs 2026 labels 1/2/3/4 → 4-channel binary masks [ET, NET, CC, ED]
+            ConvertBratsPed2025Labelsd(keys=["label"]),
             # Pad only if any dimension is smaller than one patch (rare for brain MRI)
             SpatialPadd(keys=["image", "label"], spatial_size=PATCH_SIZE),
             EnsureTyped(keys=["image", "label"], track_meta=False),

@@ -8,7 +8,7 @@ Usage:
   python train_v2.py                         # safe defaults
   python train_v2.py --batch 2 --accum 2    # slightly faster if VRAM allows
   python train_v2.py --no_grad_ckpt         # disable checkpointing (faster, more VRAM)
-  python train_v2.py --epochs 300 --save_every 10
+  python train_v2.py --epochs 500 --save_every 10
 """
 
 import os
@@ -65,7 +65,7 @@ class Config:
     project_root: str   = "."
     ckpt_dir:     str   = "checkpoints"
 
-    epochs:           int   = 300
+    epochs:           int   = 500
     lr:               float = 1e-4
     weight_decay:     float = 1e-5
     # RTX 6000 Ada (48 GB): batch=4 @ 128³ BF16 + grad-ckpt ≈ 12-15 GB VRAM.
@@ -185,6 +185,18 @@ def train_epoch(
 
         scaler.scale(loss).backward()
 
+        # Cheap per-channel visibility, computed only on logged steps: without
+        # a held-out validation loop, a channel silently collapsing (e.g. ED
+        # never crossing the sigmoid threshold) is invisible behind the
+        # aggregate scalar loss. Comparing predicted vs. ground-truth positive
+        # voxel fraction per sub-region catches that immediately.
+        do_log = (i + 1) % cfg.log_every == 0
+        if do_log:
+            with torch.no_grad():
+                pred_frac = torch.sigmoid(logits_full.detach().float()).ge(0.5).float().mean(dim=(0, 2, 3, 4))
+                gt_frac   = labels.float().mean(dim=(0, 2, 3, 4))
+            channel_stats = list(zip(["ET", "NET", "CC", "ED"], pred_frac.tolist(), gt_frac.tolist()))
+
         del images, labels, outputs, wt_aux_logit, logits_full, wt_binary, wt_gt
 
         is_last = (i + 1) == len(loader)
@@ -197,12 +209,13 @@ def train_epoch(
         total_loss += loss.item() * accum
         n += 1
 
-        if (i + 1) % cfg.log_every == 0:
+        if do_log:
             lr = optimizer.param_groups[0]["lr"]
             pbar.set_postfix(loss=f"{loss.item() * accum:.4f}", lr=f"{lr:.2e}")
+            stats_str = "  ".join(f"{name}:pred={p:.4f}/gt={g:.4f}" for name, p, g in channel_stats)
             logger.info(
                 f"  epoch {epoch:>3d}  batch {i+1:>4d}/{len(loader)}"
-                f"  loss={loss.item() * accum:.4f}  lr={lr:.2e}"
+                f"  loss={loss.item() * accum:.4f}  lr={lr:.2e}  {stats_str}"
             )
 
     pbar.close()
@@ -255,7 +268,7 @@ def train_all(
     )
 
     criterion    = DiceCELoss(sigmoid=True, squared_pred=True, reduction="mean")
-    et_criterion = ETFocalLoss(et_weight=3.0, ed_weight=2.0, gamma=2.0)
+    et_criterion = ETFocalLoss(et_weight=2.5, ed_weight=3.0, gamma=2.0)
     optimizer    = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler    = LambdaLR(
         optimizer,
@@ -310,7 +323,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="BraTS-PED 2025 — MedSwinNet full-dataset training")
     p.add_argument("--project_root", default=".")
     p.add_argument("--ckpt_dir",     default="checkpoints")
-    p.add_argument("--epochs",       type=int,   default=300)
+    p.add_argument("--epochs",       type=int,   default=500)
     p.add_argument("--batch",        type=int,   default=4,
                    help="Per-step batch size. RTX 6000 Ada: 4 @ 128³ BF16+ckpt ≈ 15 GB; try 8 for more throughput.")
     p.add_argument("--accum",        type=int,   default=1,
