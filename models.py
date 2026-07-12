@@ -6,6 +6,9 @@ Unified model (~40 M params) combining:
     (MedNeXt: Woo et al. 2023 — BraTS 2023 winner)
   • 4× stacked Swin transformer blocks at bottleneck (window-MHSA + FFN, Flash Attention)
   • SPADE decoder conditioning on an auxiliary WT head (Park et al. 2019)
+  • Classwise modality attention output heads — each of [ET,NET,CC,ED] learns
+    its own softmax attention over [t1c,t1n,t2f,t2w] instead of sharing one
+    conv's weights across all classes
   • Stochastic depth (drop path) linearly scheduled 0 → 0.2 across all blocks
   • Deep supervision at full + half resolution
 
@@ -256,6 +259,61 @@ class SwinBlock(nn.Module):
         return self._inner(x)
 
 
+class ClasswiseModalityAttention(nn.Module):
+    """Spatial, per-class soft attention over the input MRI modalities, added
+    as a learned residual to each class's segmentation logit.
+
+    A plain 1x1-conv head shares its weights across all sub-regions, so a
+    modality cue useful for one class but not another has to be encoded
+    somewhere upstream in the shared decoder features. Here each class instead
+    gets its own softmax attention over [t1c, t1n, t2f, t2w], computed per
+    voxel from the decoder features, so e.g. ED (edema) can learn to lean on
+    T2f/T2w while ET leans on post-contrast T1c — learned per class rather
+    than hard-restricting the whole model to one modality subset, which would
+    starve classes that need the others.
+    """
+
+    def __init__(self, feat_ch: int, num_modalities: int, num_classes: int,
+                 hidden: int = 32, use_checkpoint: bool = False) -> None:
+        super().__init__()
+        self.num_modalities = num_modalities
+        self.num_classes    = num_classes
+        self.class_conv = nn.Conv3d(feat_ch, num_classes, kernel_size=1)
+        self.gate = nn.Sequential(
+            nn.Conv3d(feat_ch, hidden, kernel_size=1),
+            nn.InstanceNorm3d(hidden, affine=True),
+            nn.LeakyReLU(0.01, inplace=True),
+            nn.Conv3d(hidden, num_classes * num_modalities, kernel_size=1),
+        )
+        # Per-class residual strength, initialised to 0 so training starts
+        # identical to a plain 1x1-conv head and only grows if it helps.
+        self.mod_scale = nn.Parameter(torch.zeros(num_classes))
+        self.use_checkpoint = use_checkpoint
+
+    def _inner(self, feat: torch.Tensor, modalities: torch.Tensor) -> torch.Tensor:
+        B, _, H, W, D = feat.shape
+        base = self.class_conv(feat)
+
+        if modalities.shape[2:] != feat.shape[2:]:
+            modalities = F.interpolate(modalities, size=(H, W, D),
+                                        mode="trilinear", align_corners=False)
+
+        attn = self.gate(feat).view(B, self.num_classes, self.num_modalities, H, W, D)
+        attn = torch.softmax(attn, dim=2)
+        mod_maps = (attn * modalities.unsqueeze(1)).sum(dim=2)   # (B, num_classes, H, W, D)
+
+        scale = self.mod_scale.view(1, -1, 1, 1, 1)
+        return base + scale * mod_maps
+
+    def forward(self, feat: torch.Tensor, modalities: torch.Tensor) -> torch.Tensor:
+        # The (B, classes, modalities, H, W, D) attention/product tensors this
+        # computes at full resolution are cheap to recompute but expensive to
+        # keep resident for backward — checkpoint like the other blocks here.
+        if self.use_checkpoint and self.training:
+            return grad_ckpt(self._inner, feat, modalities, use_reentrant=False)
+        return self._inner(feat, modalities)
+
+
 class SPADE(nn.Module):
     """Spatially Adaptive Denormalization (Park et al. 2019).
 
@@ -350,9 +408,12 @@ class MedSwinNet(nn.Module):
         self.dec0 = DecBlock(F[1], F[0], F[0], NB[0], KS[0],                  drop_path_rates=_next(NB[0]), use_checkpoint=ck)
 
         # ── Output heads ─────────────────────────────────────────────────────
-        self.head_full = nn.Conv3d(F[0], out_channels, kernel_size=1)
+        # Classwise modality attention: each output class learns its own
+        # softmax attention over the 4 input MRI modalities (see class
+        # docstring) instead of sharing one conv's weights across all classes.
+        self.head_full = ClasswiseModalityAttention(F[0], in_channels, out_channels, use_checkpoint=ck)
         if deep_supervision:
-            self.head_half = nn.Conv3d(F[1], out_channels, kernel_size=1)
+            self.head_half = ClasswiseModalityAttention(F[1], in_channels, out_channels, use_checkpoint=ck)
 
     def forward(
         self, x: torch.Tensor
@@ -378,10 +439,10 @@ class MedSwinNet(nn.Module):
         d1 = self.dec1(d2, e1)
         d0 = self.dec0(d1, s0)
 
-        logits = self.head_full(d0)
+        logits = self.head_full(d0, x)
 
         if self.deep_supervision:
-            return [logits, self.head_half(d1)], wt_aux_logit
+            return [logits, self.head_half(d1, x)], wt_aux_logit
         return logits, wt_aux_logit
 
     def forward_inference(self, x: torch.Tensor) -> torch.Tensor:

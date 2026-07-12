@@ -50,6 +50,7 @@ from monai.transforms import (
     RandScaleIntensityd,
     RandShiftIntensityd,
     RandZoomd,
+    ResizeWithPadOrCropd,
     SpatialPadd,
     Spacingd,
     LoadImaged,
@@ -196,6 +197,8 @@ def _base_transforms() -> List:
             keys=["image", "label"],
             source_key="image",
             k_divisible=list(PATCH_SIZE),
+            start_coord_key=None,
+            end_coord_key=None,
         ),
         # Per-channel z-score over non-zero (non-air) voxels
         NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
@@ -214,6 +217,8 @@ def _base_transforms_infer() -> List:
             keys=["image"],
             source_key="image",
             k_divisible=list(PATCH_SIZE),
+            start_coord_key=None,
+            end_coord_key=None,
         ),
         NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
         EnsureTyped(keys=["image"]),
@@ -290,6 +295,12 @@ def _train_transforms() -> Compose:
             RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
             # Gamma contrast — simulates non-linear scanner response
             RandAdjustContrastd(keys=["image"], prob=0.3, gamma=(0.7, 1.5)),
+            # Force the exact patch size right before batching. Upstream steps
+            # should already produce PATCH_SIZE, but any edge-case rounding in
+            # RandRotated/RandZoomd (or an undersized source volume) would
+            # otherwise reach the DataLoader's collate_fn as a shape mismatch
+            # and crash training — this makes that impossible by construction.
+            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=PATCH_SIZE, mode="constant"),
             # track_meta=False strips MetaTensor → plain Tensor so torch.compile
             # doesn't hit cache_size_limit from MetaTensor.__torch_function__ dispatch
             EnsureTyped(keys=["image", "label"], track_meta=False),

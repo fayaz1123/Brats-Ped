@@ -23,10 +23,17 @@ from pathlib import Path
 from typing import List
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="monai")
+# Benign: RandCropByLabelClassesd zeroes a class's crop ratio for a given
+# subject when that subject has none of that label (expected given BraTS-PED's
+# per-class rarity — see ConvertBratsPed2025Labelsd docstring), not an error.
+warnings.filterwarnings("ignore", message="no available indices of class.*",
+                         category=UserWarning)
 
 
 def _worker_init(_: int) -> None:
     warnings.filterwarnings("ignore", category=FutureWarning, module="monai")
+    warnings.filterwarnings("ignore", message="no available indices of class.*",
+                             category=UserWarning)
 
 
 import torch
@@ -43,7 +50,7 @@ torch.backends.cudnn.benchmark        = True
 torch.backends.cudnn.allow_tf32       = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
-from monai.data import CacheDataset, pad_list_data_collate
+from monai.data import PersistentDataset, pad_list_data_collate
 from monai.losses import DiceCELoss
 
 from data_loader import _build_file_list, _train_transforms
@@ -81,7 +88,13 @@ class Config:
     aux_wt_weight:   float = 0.1
     ds_weights: List[float] = field(default_factory=lambda: [1.0, 0.5])
 
-    cache_rate:    float = 0.0
+    # Disk-backed cache (monai.data.PersistentDataset) for the deterministic
+    # preprocessing prefix (load, orient, resample to 1mm iso, crop-foreground,
+    # normalize) — only the random crop + augment steps re-run each epoch.
+    # Without this, that whole expensive pipeline re-runs from raw NIfTI on
+    # every sample access, every epoch, starving the GPU waiting on CPU
+    # preprocessing. Uses disk, not RAM.
+    cache_dir:     str   = "cache"
     # 12 workers keeps the Ada busy; reduce if system RAM is limited.
     num_workers:   int   = 12
     amp:           bool  = True
@@ -250,10 +263,23 @@ def train_all(
             logger.info("  Compiling model (max-autotune)...")
             model = torch.compile(model, mode="max-autotune")
 
-    ds = CacheDataset(
-        all_data, _train_transforms(),
-        cache_rate=cfg.cache_rate, num_workers=cfg.num_workers,
+    ds = PersistentDataset(
+        data=all_data, transform=_train_transforms(),
+        cache_dir=Path(cfg.cache_dir),
     )
+
+    # Warm the disk cache single-process, sequentially, before any parallel
+    # workers touch it. PersistentDataset writes each subject's cache file
+    # lazily on first access with no cross-process locking — if the real
+    # num_workers>0 training loader below hit an un-cached subject, two
+    # workers could race to write the same file and corrupt it (torn write ->
+    # "failed finding central directory" on read). One single-threaded pass
+    # here guarantees every file exists before workers ever read it.
+    logger.info(f"Warming persistent disk cache for {len(all_data)} subjects "
+                f"(single-process, avoids concurrent-write races)...")
+    for i in tqdm(range(len(ds)), desc="Cache warm-up", unit="subject"):
+        ds[i]
+
     loader = DataLoader(
         ds, batch_size=cfg.batch_size, shuffle=True,
         num_workers=cfg.num_workers, collate_fn=pad_list_data_collate,
@@ -264,7 +290,7 @@ def train_all(
     logger.info(
         f"Training on {len(all_data)} subjects | {len(loader)} batches/epoch"
         f"  eff_batch={cfg.batch_size * cfg.grad_accum_steps}"
-        f"  workers={cfg.num_workers}  cache_rate={cfg.cache_rate}"
+        f"  workers={cfg.num_workers}  cache_dir={cfg.cache_dir}"
     )
 
     criterion    = DiceCELoss(sigmoid=True, squared_pred=True, reduction="mean")
@@ -329,7 +355,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--accum",        type=int,   default=1,
                    help="Gradient accumulation steps (1 = no accumulation)")
     p.add_argument("--lr",           type=float, default=1e-4)
-    p.add_argument("--cache_rate",   type=float, default=0.0)
+    p.add_argument("--cache_dir",    default="cache",
+                   help="Disk directory caching the deterministic preprocessing prefix "
+                        "(load/resample/crop) so it isn't redone from raw NIfTI every epoch")
     p.add_argument("--num_workers",  type=int,   default=12)
     p.add_argument("--no_amp",       action="store_true")
     p.add_argument("--no_bf16",      action="store_true")
@@ -349,7 +377,7 @@ def main():
         batch_size=args.batch,
         grad_accum_steps=args.accum,
         lr=args.lr,
-        cache_rate=args.cache_rate,
+        cache_dir=args.cache_dir,
         num_workers=args.num_workers,
         amp=not args.no_amp,
         use_bf16=not args.no_bf16,
