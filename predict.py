@@ -312,9 +312,12 @@ def parse_args() -> argparse.Namespace:
                    help="Directory for per-subject NIfTI files")
     p.add_argument("--out",           default="submission.zip",
                    help="Output zip file path")
-    p.add_argument("--sw_batch_size", type=int,   default=8,
-                   help="Sliding-window patch batch size (bf16 autocast + no-grad "
-                        "inference allows a larger batch than training)")
+    p.add_argument("--sw_batch_size", type=int,   default=4,
+                   help="Sliding-window patch batch size. Peak VRAM scales roughly "
+                        "linearly with this (measured: ~16 GB at 4, ~32 GB at 8, before "
+                        "sliding-window aggregation overhead on top) — 8 leaves almost no "
+                        "headroom on a 49 GB card. Raise only if you know nothing else "
+                        "needs the GPU.")
     p.add_argument("--sw_overlap",    type=float, default=0.75,
                    help="Sliding-window overlap (0.75 recommended for submission)")
     p.add_argument("--no_tta",        action="store_true",
