@@ -1,15 +1,28 @@
 """
 BraTS-PED 2025 — training script for MedSwinNet
 
+Trains on a single held-out validation split (--val_count subjects, default
+40, randomly selected) rather than cross-validation — one run, one set of
+subjects the model never trains on, giving a real per-region validation Dice
+(ET, NET, CC, ED, TC, WT) each epoch.
+
 Usage:
-  python train.py                          # 5-fold cross-validation
-  python train.py --n_folds 1             # single train/val split
+  python train.py                          # 40 held out, rest train
+  python train.py --val_count 25          # override held-out count
   python train.py --epochs 300 --batch 2  # override defaults
 
 Checkpoints saved to:
-  checkpoints/fold{i}_best.pt
-  checkpoints/fold{i}_last.pt
+  checkpoints/fold0_best.pt
+  checkpoints/fold0_last.pt
 """
+
+import os
+# Must be set before `import torch` — the CUDA allocator reads this at context
+# init. Without it, PyTorch's caching allocator can leave several GB
+# "reserved but unallocated" (fragmentation) instead of reusing/returning it,
+# artificially inflating peak usage until an allocation fails even though
+# the actual working set would otherwise fit.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import logging
@@ -30,7 +43,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.model_selection import KFold
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -70,9 +82,8 @@ class Config:
     project_root:  str   = "."
     ckpt_dir:      str   = "checkpoints"
 
-    n_folds:       int   = 5
     seed:          int   = 42
-    val_fraction:  float = 0.2        # used when n_folds == 1
+    val_count:     int   = 40         # subjects held out for validation; rest train
 
     epochs:        int   = 300
     lr:            float = 1e-4
@@ -93,12 +104,31 @@ class Config:
     min_et_voxels:  int   = 10
     use_tta:        bool  = False  # 8-flip TTA at inference; ~8× slower — enable for final eval/submission
 
+    # Hard-cap the allocator at this fraction of total VRAM. Without any cap,
+    # this architecture can push right up to the card's ceiling with ~0
+    # headroom, and Windows' WDDM driver responds to that by paging GPU
+    # memory instead of raising a clean OOM — which looks like a hang, not a
+    # crash. But this model's own measured peak (train_v2.py) is ~44 GB on a
+    # 48 GB card — 0.9 (43.2 GB) cuts it too close and OOMs during a normal
+    # backward pass; 0.95 (~45.6 GB) leaves the model room to actually fit
+    # while still keeping ~2.4 GB free so the driver never has to page.
+    gpu_mem_fraction: float = 0.95
+
     cache_rate:    float = 0.1    # fraction of dataset cached in RAM after deterministic transforms
     num_workers:   int   = 12     # more workers feeds the GPU without stalling
     amp:           bool  = True
     use_bf16:      bool  = True   # BF16 on Ada: same speed as FP16, wider dynamic range
     compile_model: bool  = False  # torch.compile requires Triton (Linux only); disabled on Windows
     log_every:     int   = 5
+
+    # Warm-start each fold's model weights from an existing checkpoint (e.g.
+    # train_v2.py's full-dataset checkpoints/best.pt) instead of random init.
+    # Only the model weights are loaded — each fold still gets its own fresh
+    # optimizer/scheduler and trains for cfg.epochs, since the checkpoint's
+    # optimizer/scheduler state belongs to a different training run (full
+    # dataset, different total epoch count) and doesn't correspond to any
+    # single fold here. Set to "" to disable and train from scratch.
+    init_ckpt:     str   = "checkpoints/best.pt"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,12 +343,36 @@ def train_fold(
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_dir = Path(cfg.ckpt_dir)
 
+    if device.type == "cuda":
+        torch.cuda.set_per_process_memory_fraction(cfg.gpu_mem_fraction, torch.cuda.current_device())
+        logger.info(f"Fold {fold} | GPU memory capped at {cfg.gpu_mem_fraction:.0%} of total VRAM")
+
     model = MedSwinNet(
         in_channels=IN_CHANNELS,
         out_channels=OUT_CHANNELS,
         deep_supervision=True,
+        # Without this, batch=4 pushes this architecture right up against a
+        # 49 GB card's ceiling (measured: ~48 GB, effectively no headroom) —
+        # WDDM then pages GPU memory under that pressure instead of erroring,
+        # which looks like a hang rather than an OOM. train_v2.py measured
+        # ~44 GB peak at batch=4 *with* checkpointing enabled.
+        use_checkpoint=True,
     ).to(device)
     logger.info(f"Fold {fold} | params: {count_params(model)}")
+
+    if cfg.init_ckpt:
+        init_path = Path(cfg.init_ckpt)
+        if init_path.exists():
+            state = torch.load(init_path, map_location=device, weights_only=False)
+            raw   = state.get("model", state)
+            clean = {k.replace("_orig_mod.", ""): v for k, v in raw.items()}
+            model.load_state_dict(clean)
+            logger.info(
+                f"Fold {fold} | warm-started weights from {init_path} "
+                f"(epoch={state.get('epoch', '?')}, loss={state.get('loss', '?')})"
+            )
+        else:
+            logger.info(f"Fold {fold} | --init_ckpt {init_path} not found — training from scratch.")
 
     if cfg.compile_model:
         import sys
@@ -412,7 +466,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="BraTS-PED 2025 — MedSwinNet")
     p.add_argument("--project_root", default=".")
     p.add_argument("--ckpt_dir",     default="checkpoints")
-    p.add_argument("--n_folds",      type=int,   default=5)
+    p.add_argument("--val_count",    type=int,   default=40,
+                   help="Number of subjects held out for validation (rest train)")
     p.add_argument("--epochs",       type=int,   default=300)
     p.add_argument("--batch",        type=int,   default=4)
     p.add_argument("--lr",           type=float, default=1e-4)
@@ -424,6 +479,14 @@ def parse_args() -> argparse.Namespace:
     # torch.compile disabled by default on Windows (no Triton); set compile_model=True in Config if on Linux
     p.add_argument("--use_tta",      action="store_true", help="Enable 8-flip TTA at validation (slow)")
     p.add_argument("--grad_accum",   type=int, default=1, help="Gradient accumulation steps")
+    p.add_argument("--init_ckpt",    default="checkpoints/best.pt",
+                   help="Warm-start each fold's model weights from this checkpoint "
+                        "(empty string to train from scratch)")
+    p.add_argument("--gpu_mem_fraction", type=float, default=0.95,
+                   help="Cap the CUDA allocator at this fraction of total VRAM "
+                        "(default 0.95) — leaves a small safety margin against "
+                        "WDDM paging-induced stalls without cutting into this "
+                        "model's own ~44 GB measured peak")
     return p.parse_args()
 
 
@@ -432,7 +495,7 @@ def main():
     cfg  = Config(
         project_root=args.project_root,
         ckpt_dir=args.ckpt_dir,
-        n_folds=args.n_folds,
+        val_count=args.val_count,
         epochs=args.epochs,
         batch_size=args.batch,
         lr=args.lr,
@@ -443,6 +506,8 @@ def main():
         use_bf16=not args.no_bf16,
         use_tta=args.use_tta,
         grad_accum_steps=args.grad_accum,
+        init_ckpt=args.init_ckpt,
+        gpu_mem_fraction=args.gpu_mem_fraction,
     )
 
     Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -456,43 +521,21 @@ def main():
     all_data = _build_file_list(Path(cfg.project_root), require_seg=True)
     logger.info(f"Total subjects: {len(all_data)}")
 
-    if cfg.n_folds == 1:
-        rng   = np.random.default_rng(cfg.seed)
-        idx   = rng.permutation(len(all_data))
-        n_val = max(1, int(len(all_data) * cfg.val_fraction))
-        best  = train_fold(
-            0,
-            [all_data[i] for i in idx[n_val:]],
-            [all_data[i] for i in idx[:n_val]],
-            cfg, logger,
-        )
-        logger.info(f"Best mean Dice: {best:.4f}")
-        return
-
-    kfold = KFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.seed)
-    dices: List[float] = []
-
-    for fold, (tr_idx, va_idx) in enumerate(kfold.split(all_data)):
-        logger.info(
-            f"\n{'='*60}\n"
-            f"Fold {fold}  train={len(tr_idx)}  val={len(va_idx)}\n"
-            f"{'='*60}"
-        )
-        d = train_fold(
-            fold,
-            [all_data[i] for i in tr_idx],
-            [all_data[i] for i in va_idx],
-            cfg, logger,
-        )
-        dices.append(d)
-        logger.info(f"Fold {fold} best = {d:.4f}")
-
+    n_val = max(1, min(cfg.val_count, len(all_data) - 1))
+    rng   = np.random.default_rng(cfg.seed)
+    idx   = rng.permutation(len(all_data))
     logger.info(
-        f"\n{'='*60}\n5-fold CV summary\n"
-        + "\n".join(f"  fold {i}: {d:.4f}" for i, d in enumerate(dices))
-        + f"\n  mean : {np.mean(dices):.4f} ± {np.std(dices):.4f}\n"
-        + "=" * 60
+        f"Held-out split: {len(all_data) - n_val} train, {n_val} val "
+        f"(seed={cfg.seed})"
     )
+
+    best = train_fold(
+        0,
+        [all_data[i] for i in idx[n_val:]],
+        [all_data[i] for i in idx[:n_val]],
+        cfg, logger,
+    )
+    logger.info(f"Best mean Dice: {best:.4f}")
     logger.info("Training complete.")
 
 

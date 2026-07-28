@@ -41,7 +41,7 @@ from monai.transforms import (
     NormalizeIntensityd,
     Orientationd,
     RandAdjustContrastd,
-    RandCropByLabelClassesd,
+    RandCropByPosNegLabeld,
     RandFlipd,
     RandGaussianNoised,
     RandGaussianSmoothd,
@@ -50,7 +50,6 @@ from monai.transforms import (
     RandScaleIntensityd,
     RandShiftIntensityd,
     RandZoomd,
-    ResizeWithPadOrCropd,
     SpatialPadd,
     Spacingd,
     LoadImaged,
@@ -167,18 +166,13 @@ TARGET_SPACING = (1.0, 1.0, 1.0)  # isotropic 1 mm
 
 def _base_transforms() -> List:
     """
-    Shared preprocessing: load → orient → resample → normalize.
+    Shared preprocessing: load → orient → resample → convert labels → normalize.
 
     Note: data is defaced but NOT skull-stripped (BraTS-PED 2025 policy).
     Skull voxels remain; CropForegroundd trims air padding using a threshold
     above background so skull tissue is preserved in the crop.
     Per-channel z-score normalization with nonzero=True correctly ignores only
     the background air, leaving skull and brain intensities intact.
-
-    Label conversion to 4-channel binary masks (ConvertBratsPed2025Labelsd) is
-    deliberately NOT included here — it happens after cropping (see
-    _train_transforms / _val_transforms) so the raw categorical label (values
-    0-4) is still available for RandCropByLabelClassesd's per-class sampling.
     """
     return [
         LoadImaged(keys=["image", "label"], ensure_channel_first=False),
@@ -191,14 +185,14 @@ def _base_transforms() -> List:
             pixdim=TARGET_SPACING,
             mode=("bilinear", "nearest"),
         ),
+        # BraTS-PEDs 2026 labels 1/2/3/4 → 4-channel binary masks [ET, NET, CC, ED]
+        ConvertBratsPed2025Labelsd(keys=["label"]),
         # Remove background air padding (skull is preserved — threshold > 0 keeps
         # all tissue voxels including skull since data is not skull-stripped)
         CropForegroundd(
             keys=["image", "label"],
             source_key="image",
             k_divisible=list(PATCH_SIZE),
-            start_coord_key=None,
-            end_coord_key=None,
         ),
         # Per-channel z-score over non-zero (non-air) voxels
         NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
@@ -217,8 +211,6 @@ def _base_transforms_infer() -> List:
             keys=["image"],
             source_key="image",
             k_divisible=list(PATCH_SIZE),
-            start_coord_key=None,
-            end_coord_key=None,
         ),
         NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
         EnsureTyped(keys=["image"]),
@@ -230,30 +222,17 @@ def _train_transforms() -> Compose:
         _base_transforms()
         + [
             # ── Spatial augmentations ──────────────────────────────────────
-            # Class-balanced patch sampling on the raw categorical label
-            # (0=bg, 1=ET, 2=NET, 3=CC, 4=ED), BEFORE it's split into 4
-            # binary channels. RandCropByPosNegLabeld (previous approach)
-            # treated the whole 4-channel mask as one foreground blob, so a
-            # crop centered on the dominant NET region counted as "positive"
-            # even with zero ED voxels in it — ED (rarest sub-region, present
-            # in only ~22% of subjects vs. NET's ~99%) was almost never
-            # actually sampled. Ratios below are ~inverse to each class's
-            # subject-level prevalence so every sub-region — especially ED —
-            # gets deliberate representation in training crops. When a class
-            # is absent from a given subject, MONAI zeroes its ratio for that
-            # sample and renormalizes among the classes present.
-            RandCropByLabelClassesd(
+            # Foreground-biased patch sampling (2:1 positive-to-negative ratio)
+            RandCropByPosNegLabeld(
                 keys=["image", "label"],
                 label_key="label",
                 spatial_size=PATCH_SIZE,
-                ratios=[1, 2, 1, 3, 5],   # [bg, ET, NET, CC, ED]
-                num_classes=5,
+                pos=2,
+                neg=1,
                 num_samples=1,
                 image_key="image",
                 image_threshold=0,
             ),
-            # BraTS-PEDs 2026 labels 1/2/3/4 → 4-channel binary masks [ET, NET, CC, ED]
-            ConvertBratsPed2025Labelsd(keys=["label"]),
             # Axis-aligned flips — p=0.5 per axis
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
             RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
@@ -295,12 +274,6 @@ def _train_transforms() -> Compose:
             RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
             # Gamma contrast — simulates non-linear scanner response
             RandAdjustContrastd(keys=["image"], prob=0.3, gamma=(0.7, 1.5)),
-            # Force the exact patch size right before batching. Upstream steps
-            # should already produce PATCH_SIZE, but any edge-case rounding in
-            # RandRotated/RandZoomd (or an undersized source volume) would
-            # otherwise reach the DataLoader's collate_fn as a shape mismatch
-            # and crash training — this makes that impossible by construction.
-            ResizeWithPadOrCropd(keys=["image", "label"], spatial_size=PATCH_SIZE, mode="constant"),
             # track_meta=False strips MetaTensor → plain Tensor so torch.compile
             # doesn't hit cache_size_limit from MetaTensor.__torch_function__ dispatch
             EnsureTyped(keys=["image", "label"], track_meta=False),
@@ -317,8 +290,6 @@ def _val_transforms() -> Compose:
     return Compose(
         _base_transforms()
         + [
-            # BraTS-PEDs 2026 labels 1/2/3/4 → 4-channel binary masks [ET, NET, CC, ED]
-            ConvertBratsPed2025Labelsd(keys=["label"]),
             # Pad only if any dimension is smaller than one patch (rare for brain MRI)
             SpatialPadd(keys=["image", "label"], spatial_size=PATCH_SIZE),
             EnsureTyped(keys=["image", "label"], track_meta=False),
