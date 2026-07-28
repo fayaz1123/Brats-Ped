@@ -47,5 +47,8 @@ predictions/
 *.zip
 manifest_*.csv
 
+# Docker submission package (contains a full checkpoint, built locally as needed)
+docker_submission/
+
 # Scripts with secrets
 download_.py

@@ -99,7 +99,10 @@ class Config:
     aux_wt_weight:   float = 0.1
     ds_weights: List[float] = field(default_factory=lambda: [1.0, 0.5])
 
-    sw_batch_size:  int   = 8     # 48 GB VRAM: 8 patches in parallel at validation
+    # predict.py measured 8 -> 4 saving ~21 GB peak VRAM with identical
+    # throughput (sliding-window patches are small relative to a full batch
+    # forward); train.py predates that fix, so it inherited the old default.
+    sw_batch_size:  int   = 4
     sw_overlap:     float = 0.75  # 0.75 reduces stitching artefacts at patch boundaries (competition standard)
     min_et_voxels:  int   = 10
     use_tta:        bool  = False  # 8-flip TTA at inference; ~8× slower — enable for final eval/submission
@@ -249,16 +252,24 @@ def train_epoch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sw_predict(model: nn.Module, images: torch.Tensor, cfg: Config) -> torch.Tensor:
-    """Sliding-window inference returning sigmoid probabilities."""
-    logits = sliding_window_inference(
-        inputs=images,
-        roi_size=PATCH_SIZE,
-        sw_batch_size=cfg.sw_batch_size,
-        predictor=model.forward_inference,
-        overlap=cfg.sw_overlap,
-        mode="gaussian",
-    )
-    return torch.sigmoid(logits)
+    """Sliding-window inference returning sigmoid probabilities.
+
+    Gradient checkpointing is a no-op in eval mode, so without autocast this
+    ran sw_batch_size patches through in full FP32 with the full activation
+    memory of every layer — that's what produced the 16 GiB single-tensor
+    OOM. bf16 halves that footprint, matching train_epoch and predict.py.
+    """
+    dtype = torch.bfloat16 if cfg.use_bf16 else torch.float16
+    with autocast("cuda", dtype=dtype, enabled=cfg.amp):
+        logits = sliding_window_inference(
+            inputs=images,
+            roi_size=PATCH_SIZE,
+            sw_batch_size=cfg.sw_batch_size,
+            predictor=model.forward_inference,
+            overlap=cfg.sw_overlap,
+            mode="gaussian",
+        )
+    return torch.sigmoid(logits.float())
 
 
 @torch.inference_mode()
