@@ -86,7 +86,11 @@ class Config:
     val_count:     int   = 40         # subjects held out for validation; rest train
 
     epochs:        int   = 300
-    lr:            float = 1e-4
+    # 1e-4 is the from-scratch peak LR train_v2.py used to produce best.pt.
+    # Fine-tuning that already-converged checkpoint at the same peak LR
+    # regressed validation Dice as soon as warmup ramped up to it (best
+    # result was at ~2e-5, still in warmup); lowered to match.
+    lr:            float = 2e-5
     weight_decay:  float = 1e-5
     batch_size:    int   = 4      # RTX 6000 Ada (48 GB): fits 4× 128³; reduce to 2 if OOM with scaled model
     warmup_epochs: int   = 10
@@ -481,7 +485,11 @@ def parse_args() -> argparse.Namespace:
                    help="Number of subjects held out for validation (rest train)")
     p.add_argument("--epochs",       type=int,   default=300)
     p.add_argument("--batch",        type=int,   default=4)
-    p.add_argument("--lr",           type=float, default=1e-4)
+    p.add_argument("--lr",           type=float, default=2e-5,
+                   help="Peak LR after warmup. Lowered from the 1e-4 used for "
+                        "from-scratch training -- this run fine-tunes an "
+                        "already-converged checkpoint, and 1e-4 regressed "
+                        "validation Dice as soon as warmup reached it.")
     p.add_argument("--cache_rate",   type=float, default=0.0)
     p.add_argument("--num_workers",  type=int,   default=8)
     p.add_argument("--seed",         type=int,   default=42)

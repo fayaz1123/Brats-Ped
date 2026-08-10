@@ -292,11 +292,17 @@ def run(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="BraTS-PED 2026 — inference & submission zip")
-    p.add_argument("--ckpt",          default=None,
-                   help="Single checkpoint file (e.g. checkpoints/last.pt). "
-                        "Takes priority over --ckpt_dir.")
+    p.add_argument("--ckpt",          default="checkpoints/best.pt",
+                   help="Single checkpoint file. Takes priority over --ckpt_dir. "
+                        "Defaults to checkpoints/best.pt rather than falling through "
+                        "to --ckpt_dir's fold*_best.pt/epoch_*.pt/last.pt search, since "
+                        "that search can silently pick up an unrelated checkpoint (e.g. "
+                        "a fold*_best.pt from an unrelated held-out validation run) "
+                        "instead of the actual best full-dataset model. Pass --ckpt \"\" "
+                        "to fall back to the --ckpt_dir search explicitly.")
     p.add_argument("--ckpt_dir",      default="checkpoints",
-                   help="Directory searched for fold*_best.pt → epoch_*.pt → last.pt")
+                   help="Directory searched for fold*_best.pt → epoch_*.pt → last.pt "
+                        "(only used when --ckpt is explicitly set to \"\")")
     p.add_argument("--fold",          type=int, default=None,
                    help="Use only fold N checkpoint (ignored when --ckpt is set)")
     p.add_argument("--val_dir",       default="data/BraTS26_PED_validation",
